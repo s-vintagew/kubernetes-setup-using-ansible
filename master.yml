@@ -1,0 +1,420 @@
+---
+- name: Playboook to configure the master node with kubernetes
+  hosts: master
+  become: true
+  # change this variable as per your requirement
+  vars:
+    - cni_plugin_version: https://github.com/containernetworking/plugins/releases/download/v1.4.0/cni-plugins-linux-amd64-v1.4.0.tgz
+    - regular_user: devuser
+    - short_version: v1.27
+    - version: 1.27.6-00 # not used yet, maybe of use later
+    - calico_version: v3.27.1
+  tasks:
+    - name: Firewall configurations
+      block:
+        - name: Check if firewalld is installed
+          stat:
+            path: /usr/bin/firewall-cmd
+          register: firewalld_installed
+          ignore_errors: yes
+
+        - name: Check if ufw is installed
+          stat:
+            path: /usr/sbin/ufw
+          register: ufw_installed
+          ignore_errors: yes
+
+        - name: Open ports for firewalld
+          when: firewalld_installed.stat.exists
+          block:
+            - name: Open port 6443 for API Server
+              shell: "firewall-cmd --add-port=6443/tcp --permanent"
+              ignore_errors: yes
+
+            - name: Open port 2379 for Etcd client communication
+              shell: "firewall-cmd --add-port=2379/tcp --permanent"
+              ignore_errors: yes
+
+            - name: Open port 2380 for Etcd server-to-server communication
+              shell: "firewall-cmd --add-port=2380/tcp --permanent"
+              ignore_errors: yes
+
+            - name: Open port 10250 for Kubelet
+              shell: "firewall-cmd --add-port=10250/tcp --permanent"
+              ignore_errors: yes
+
+            # Uncomment the below lines, only when you know the implementation of using NodePort
+            # - name: Open port range 30000-32767 for NodePort Services
+            #   shell: "for port in $(seq 30000 32767); do firewall-cmd --add-port=$port/tcp --permanent; done"
+            #   ignore_errors: yes
+            
+            - name: Reloading the firewalld
+              shell: "firewall-cmd --reload"     
+              ignore_errors: yes           
+
+        - name: Open ports for ufw
+          when: ufw_installed.stat.exists
+          block:
+            - name: Open port 6443 for API Server
+              shell: "ufw allow 6443/tcp"
+              ignore_errors: yes
+
+            - name: Open port 2379 for Etcd client communication
+              shell: "ufw allow 2379/tcp"
+              ignore_errors: yes
+
+            - name: Open port 2380 for Etcd server-to-server communication
+              shell: "ufw allow 2380/tcp"
+              ignore_errors: yes
+
+            - name: Open port 10250 for Kubelet
+              shell: "ufw allow 10250/tcp"
+              ignore_errors: yes
+
+            # uncomment below lines only if you know the implimentation of using NodePort 
+            # - name: Open port range 30000-32767 for NodePort Services
+            #   shell: "ufw allow 30000:32767/tcp"
+            #   ignore_errors: yes
+
+    - name: Update and Upgrade the apt packages before proceeding
+      block:
+        - name: performing the Update
+          ansible.builtin.apt:
+            update_cache: true
+
+    - name: Block to manage Swap space
+      block:
+        - name: Check for swap to be on
+          ansible.builtin.shell: "swapon -s | wc -l"
+          register: number_of_swap
+          changed_when: false
+
+        - name: Turning off swaps
+          ansible.builtin.shell: "swapoff -a"
+          when: number_of_swap.stdout != 0
+
+        - name: Check for swap in /etc/fstab
+          ansible.builtin.shell: "sudo cat /etc/fstab | awk '{print $3}' | grep swap | wc -l"
+          register: number_in_fstab
+          changed_when: false
+
+        - name: Changing entries in fstab
+          ansible.builtin.lineinfile:
+            path: /etc/fstab
+            regexp: '.*swap.*'
+            line: '# \g<0>'
+          when: number_in_fstab.stdout != '0'
+    
+    - name: Change the hostname 
+      ansible.builtin.hostname:
+        name: master
+    
+    - name: Making neccesary changes in the etc hosts file
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "127.0.0.1 master"
+        state: present
+
+    - name: Configure the sysctl for kubernetes
+      ansible.builtin.shell: "{{ item }}"
+      loop:
+        - "echo 'net.bridge.bridge-nf-call-ip6tables = 1' | tee /etc/sysctl.d/k8s.conf"
+        - "echo 'net.bridge.bridge-nf-call-iptables = 1' | tee -a /etc/sysctl.d/k8s.conf"
+        - "sysctl --system"
+      ignore_errors: yes
+    
+    - name: Check if br_netfilter is set
+      ansible.builtin.shell: "lsmod | grep br_net | wc -l"
+      register: lsmod_results
+
+    - name: Load br_netfilter module
+      ansible.builtin.shell: "{{ item }}"
+      loop:
+        - "echo 'br_netfilter' | tee /etc/modules-load.d/k8s.conf"
+        - "modprobe br_netfilter"
+      ignore_errors: yes
+      when: lsmod_results.stdout != '2'
+
+    - name: Checking for ip_forward configurations
+      ansible.builtin.shell: "cat /proc/sys/net/ipv4/ip_forward"
+      register: ip_forward_result
+      changed_when: false
+
+    - name: Forward IP persistently if required
+      block:
+        - name: Forwarding the IP in sysctl
+          ansible.builtin.lineinfile:
+            path: /etc/sysctl.conf
+            line: "net.ipv4.ip_forward=1"
+            state: present
+          register: forwarded 
+        
+        - name: Change the ip_forward for runtime
+          ansible.builtin.shell: "sysctl -w net.ipv4.ip_forward=1"
+          
+        - name: Reloading the sysctl config
+          ansible.builtin.shell: "sysctl -p /etc/sysctl.conf"
+          when: forwarded is changed 
+      when: ip_forward_result.stdout != '1'
+    
+    - name: Check and Remove docker if previous versions exist 
+      block:
+        - name: Remove the docker and containerd package
+          ansible.builtin.apt:
+            name:
+              - docker.io
+            state: absent
+
+    - name: Add the apt repository of containerd and Install containerd runtime
+      block:
+        - name: Check if keyring is already present
+          ansible.builtin.stat:
+            path: /usr/share/keyrings/docker.gpg
+          register: containerd_keyring_present
+
+        - name: Adding the Containerd repo key
+          ansible.builtin.apt_key:
+            url: https://download.docker.com/linux/ubuntu/gpg
+            keyring: /usr/share/keyrings/docker.gpg 
+          when: containerd_keyring_present.stat.exists != 'true'
+
+        - name: Retreive dpkg architecture 
+          ansible.builtin.shell: "echo $(dpkg --print-architecture)"
+          register: dpkg_architecture
+          changed_when: false
+          ignore_errors: true
+
+        - name: The containerd repo
+          ansible.builtin.shell: "echo 'deb [arch={{ dpkg_architecture.stdout }} signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable' | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null"
+          changed_when: false
+          ignore_errors: true
+
+        - name: Installing containerd runtime
+          ansible.builtin.apt:
+            name: containerd
+            state: present
+    
+    - name: Setting up the containerd runtime configurations
+      block:
+        - name: Making sure the unarchive directory exists 
+          ansible.builtin.file: 
+            path: "/opt/cni/bin/"
+            state: directory
+
+        - name: Download and unarchive the cni plugin tar file  
+          ansible.builtin.unarchive:
+            src: "{{ cni_plugin_version }}"
+            dest: "/opt/cni/bin/"
+            remote_src: yes
+        
+        - name: Make the directory
+          ansible.builtin.file:
+            path: /etc/containerd
+            state: directory
+
+        - name: Generate CNI configurations
+          ansible.builtin.shell: "containerd config default > /etc/containerd/config.toml"
+        
+        - name: Change the systemd driver of containerd
+          ansible.builtin.replace:
+            path: /etc/containerd/config.toml
+            regexp: 'SystemdCgroup = false'
+            replace: 'SystemdCgroup = true'
+            
+    - name: Changing the user permissions to access container socket
+      block:
+        - name: Setting up a group
+          ansible.builtin.group:
+            name: containerd
+            state: present
+        
+        - name: Retrive the group id
+          ansible.builtin.shell: "cat /etc/group | grep containerd | awk -F ':' '{print $3}'"
+          register: containerd_group_id
+
+        - name: Adding the user to the group
+          ansible.builtin.user: 
+            name: devuser
+            groups: containerd
+            append: yes
+        
+        - name: Add the group id in the config file 
+          ansible.builtin.replace:
+            path: /etc/containerd/config.toml
+            after: '[grpc]\n*address = "/run/containerd/containerd.sock"'
+            regexp: gid = 0
+            replace: 'gid = {{ containerd_group_id.stdout }}'
+
+        - name: Changing permission of the socket to the group
+          ansible.builtin.file: 
+            path: "/run/containerd/containerd.sock"
+            group: containerd
+
+    - name: Reloading the containerd service
+      ansible.builtin.service:
+        name: containerd
+        state: restarted
+        enabled: true
+
+    - name: Install dependent packages
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - conntrack
+        state: present
+
+    - name: Make the Keyring directory
+      ansible.builtin.file:
+        path: /usr/share/keyrings
+        state: directory
+        mode: 755
+
+    - name: Add the Apt repository /usr/share/keyrings/kubernetes-archive-keyring.gpg
+      block:
+        - name: Check if the keyring file is already present
+          ansible.builtin.stat:
+            path: /usr/share/keyrings/kubernetes-archive-keyring.gpg
+          register: gpg_key_present
+
+        - name: Add apt key
+          ansible.builtin.apt_key:
+            url: https://pkgs.k8s.io/core:/stable:/{{ short_version }}/deb/Release.key
+            keyring: /usr/share/keyrings/kubernetes-archive-keyring.gpg
+          when: gpg_key_present.stat.exists != 'true'
+
+    - name: Add the Kubernetes Repository
+      ansible.builtin.apt_repository:
+        repo: deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ short_version }}/deb/ /
+        state: present
+        filename: kubernetes
+    
+    - name: Perform an apt update
+      ansible.builtin.apt:
+        update_cache: yes
+
+    - name: Install the main kubeadm, kubelet, kubectl
+      ansible.builtin.apt:
+        name: 
+          - 'kubelet'
+          - 'kubeadm'
+          - 'kubectl'
+        state: present
+      ignore_errors: true
+
+    - name: Check if the containerd service is unmasked
+      ansible.builtin.shell: "systemctl is-enabled containerd"
+      register: masked_containerd
+      changed_when: false
+
+    - name: Unmask the containerd, if masked 
+      ansible.builtin.shell: "systemctl unmask containerd"
+      when: masked_containerd.stdout == 'masked'
+
+    - name: Check if the kubelet service is unmasked
+      ansible.builtin.shell: "systemctl is-enabled kubelet"
+      register: masked_kubelet
+      changed_when: false
+
+    - name: Unmask the docker, if masked 
+      ansible.builtin.shell: "systemctl unmask kubelet"
+      when: masked_kubelet.stdout == 'masked'  
+
+    - name: Making sure kubelet service is stopped
+      ansible.builtin.service:
+        name: kubelet
+        state: stopped
+        enabled: true
+    
+    - name: Making sure containerd service is started
+      ansible.builtin.service:
+        name: containerd
+        state: started
+
+    - name: Start the Kubeadm init
+      ansible.builtin.shell: "kubeadm init"
+      register: kubeadm_init_result
+      ignore_errors: true
+
+    - name: Debugging the Result
+      ansible.builtin.debug:
+        msg: "{{ kubeadm_init_result }}"
+
+    - name: Execute these if kubeadm is correctly started
+      block:
+        - name: Create the directory in user folder
+          ansible.builtin.file: 
+            path: '/home/{{ regular_user }}/.kube'
+            owner: "{{ regular_user }}"
+            group: "{{ regular_user }}"
+            state: directory
+            mode: 755
+        
+        - name: Export the config
+          ansible.builtin.shell: "export KUBECONFIG=/etc/kubernetes/admin.conf"
+
+        - name: Copy the kubeadm admin config from the etc dir to userdir
+          ansible.builtin.shell: "{{ item }}"
+          loop:
+            - "cp /etc/kubernetes/admin.conf /home/{{ regular_user }}/.kube/config"
+            - "chown {{ regular_user }}:{{ regular_user }} /home/{{ regular_user }}/.kube/config"
+
+        - name: Install the calico Plugin
+          become: false
+          ansible.builtin.command: "kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/calico.yaml"
+        
+        - name: Check the cluster status 
+          become: false
+          ansible.builtin.command: "kubectl get nodes"
+          register: cluster_initial
+
+        - name: Copy the join command in a remote file
+          ansible.builtin.copy:
+            content: |
+              "{{ kubeadm_init_result.stdout_lines }}"
+            dest: "/tmp/join-command"
+
+        - name: Cat the kubeadm join to get the single line
+          ansible.builtin.shell: >
+            cat /tmp/join-command | 
+            awk -F ',' '{print $(NF-1) $(NF)}' |
+            sed "s/\\\\' '\\\t//g" | 
+            sed "s/\\\--discovery/--discovery/" |  
+            sed "s/'\]\"//" | sed "s/'//"
+          register: one_line_command
+
+        - name: Rewriting the join command  
+          ansible.builtin.copy:
+            content: "{{ one_line_command.stdout }}"
+            dest: "/tmp/join-command"
+
+        - name: Get the join command in main node
+          ansible.builtin.fetch:
+            src: "/tmp/join-command"
+            dest: "./join-command"
+            flat: yes
+
+        - name: Displaying the Kubeadm Init Kubeadm Init Result
+          ansible.builtin.debug:
+            msg: "{{ kubeadm_init_result }}"
+
+        - name: Displaying the Cluster status
+          ansible.builtin.debug:
+            msg: "{{ cluster_initial.stdout }}"
+    
+- name: Playbook for checking from regular user
+  hosts: master
+  become: false
+  tasks:
+    - name: Checking for the shell of system
+      shell: "echo $SHELL | awk -F '/' '{print $3}'"
+      register: system_shell
+      ignore_errors: true
+    
+    - name: Setting the bash completion
+      shell: "{{ item }}"
+      loop:
+        - "kubectl completion {{ system_shell.stdout }} > ~/.kube/kubectl_completion.sh"
+        - "echo 'source ~/.kube/kubectl_completion.sh' >> ~/.bashrc"
+
