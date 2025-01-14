@@ -3,23 +3,25 @@
 ## Install and Configure Kubernetes Master Node using Ansible playbook
 
 
-"In the digital era, Kubernetes via Ansible playbooks streamlines containerized application management, enhancing scalability and reliability." - ChatGPT
+"In the digital era, Kubernetes via Ansible playbooks streamlines containerized application management, enhancing scalability and reliability." - ChatGPT<br>
+
 The Prerequisites that we will be using are:
-OS used: Ubuntu 20.04 LTS
-Recommended RAM: 4 GB
+1. OS used: Ubuntu 20.04 LTS
+2. Recommended RAM: 4 GB
 
 ---
 
-Specifications we will be working on <br>
-Kubeadm version: 1.27 <br>
-Calico Version: 3.27.1 <br>
-Calico plugin link: https://github.com/containernetworking/plugins/releases/download/v1.4.0/cni-plugins-linux-amd64-v1.4.0.tgz <br>
-Runtime: Containerd <br>
-Remote User of the remote host: devuser <br>
+Specifications we will be working on
+1. Kubeadm version: 1.2
+2. Calico Version: 3.27.1
+3. Calico plugin link: https://github.com/containernetworking/plugins/releases/download/v1.4.0/cni-plugins-linux-amd64-v1.4.0.tgz
+4. Runtime: Containerd
+5. Remote User of the remote host: devuser
 
 ---
 
-```Before we begin let us go through the per-requisite of installing ansible in our system. Remember we need to have ssh-keys configured on the managed nodes [our server which will serve as master node for kubernetes].
+Before we begin let us go through the per-requisite of installing ansible in our system. Remember we need to have ssh-keys configured on the managed nodes [our server which will serve as master node for kubernetes].
+```
 #In case of Ubuntu etc.
 sudo apt-get update && sudo apt-get upgrade
 sudo apt install ansible
@@ -28,7 +30,8 @@ sudo apt install ansible
 sudo dnf install ansible
 ```
 Also you will need python install in the managed hosts, which I assume will already be present in any basic Linux installation. Just in case you need the ssh-keys configuration command, here are the commands.
-```#To generate the ssh keys
+```
+#To generate the ssh keys
 ssh-keygen
 
 #To copy the ssh id's to remote machine
@@ -52,7 +55,8 @@ Next we move on to create the tasks.<br>
 
 First things first, we need to turn on the basic firewall ports that are required for the kubelet service and kuberenetes API server to interact with other nodes. Now mostly we have ufw and firewalld being used, so we will check the firewall service present and using when condition, configure the appropriate service.
 Note: To manage firewalld we could have used firewalld module as well, and that's perfectly fine. Go ahead and tweak accordingly.
-```- name: Firewall configurations
+```
+- name: Firewall configurations
   block:
     - name: Check if firewalld is installed
       stat:
@@ -120,8 +124,7 @@ Just in case we want no hassles in later stage while we do the repo configs, we 
 Then we will turn off the swap spaces. Now swap spaces can be persistently mounted as well in the /etc/fstab file, so only turning them off using swapoff -a is not going to work in case the node reboots. So we will comment out the entry in the /etc/fstab file as well.
 ```
 - name: Block to manage Swap space
-# I have used a block here, just for my ease of navigating through the file,
-# you can have these tasks out of the block also
+# I have used a block here, just for my ease of navigating through the file, you can have these tasks out of the block also
   block:
     - name: Check for swap to be on 
       shell: "swapon -s | wc -l"
